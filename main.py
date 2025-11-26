@@ -39,29 +39,30 @@ def startup_event():
 MANUAL_WATERING_ON = False
 
 # ==========================================
-# 1. ENDPOINT: IOT SENSOR KELEMBAPAN (JSON Body)
+# 1. ENDPOINT: IOT SENSOR KELEMBAPAN (Mode: Realtime Gauge)
 # ==========================================
 @app.post("/iot/soil-data", response_model=schemas.IotResponse)
 def receive_soil_data(
-    data: schemas.SoilDataInput, # <-- MENGGUNAKAN SCHEMA
+    data: schemas.SoilDataInput, 
     db: Session = Depends(get_db)
 ):
     """
-    IoT Mengirim JSON: {"tanaman_id": 1, "moisture": 30.5}
+    Cocok untuk Gauge Chart / Speedometer.
+    Hanya menyimpan 1 baris data terakhir per tanaman.
     """
     global MANUAL_WATERING_ON
     
-    # Akses data menggunakan titik (.)
     t_id = data.tanaman_id
     mois = data.moisture
     
     pump_status = False
     trigger = "AUTO"
 
-    if mois < 45.0:
+    # Logika Kontrol Pompa
+    if mois < 50.0:
         pump_status = True
         print(f"🌱 [AUTO] Kering ({mois}%), Pompa NYALA.")
-    elif mois > 60.0:
+    elif mois > 70.0:
         pump_status = False
         print(f"💧 [AUTO] Basah ({mois}%), Pompa MATI.")
         if MANUAL_WATERING_ON: 
@@ -71,31 +72,56 @@ def receive_soil_data(
         pump_status = True
         trigger = "MANUAL"
 
-    # Simpan ke DB
+    # --- LOGIKA DATABASE (UPDATE OR INSERT) ---
     try:
-        new_log = models.LogKelembapan(
-            tanaman_id=t_id,
-            kelembapan_tanah=mois,
-            pompa_on=pump_status,
-            sumber_perintah=trigger
-        )
-        db.add(new_log)
-        db.commit()
+        # 1. Cari data lama berdasarkan ID Tanaman
+        existing_data = db.query(models.LogKelembapan)\
+                          .filter(models.LogKelembapan.tanaman_id == t_id)\
+                          .first()
+        
+        if existing_data:
+            # === SKENARIO A: UPDATE (Jarum Gauge Bergerak) ===
+            # Kita timpa nilai lama dengan nilai baru
+            existing_data.kelembapan_tanah = mois
+            existing_data.pompa_on = pump_status
+            existing_data.sumber_perintah = trigger
+            # Paksa update waktu agar kita tahu kapan terakhir update
+            # (Penting untuk status 'Last Updated' di Web)
+            from sqlalchemy.sql import func
+            existing_data.updated_at = func.now()
+            
+            db.commit()
+            print(f"📝 Update Data Tanaman {t_id} -> {mois}%")
+            
+        else:
+            # === SKENARIO B: INSERT (Baru Pertama Kali Pasang) ===
+            new_log = models.LogKelembapan(
+                tanaman_id=t_id,
+                kelembapan_tanah=mois,
+                pompa_on=pump_status,
+                sumber_perintah=trigger
+            )
+            db.add(new_log)
+            db.commit()
+            print(f"✨ Data Baru Tanaman {t_id} -> {mois}%")
+            
     except Exception as e:
         print(f"❌ Error DB: {e}")
+        db.rollback()
     
     return {"status": "success", "pump": "ON" if pump_status else "OFF"}
 
 # ==========================================
-# 2. ENDPOINT: IOT ULTRASONIK TANGKI (JSON Body)
+# 2. ENDPOINT: IOT ULTRASONIK TANGKI (Mode: Realtime Gauge)
 # ==========================================
 @app.post("/iot/water-level", response_model=schemas.IotResponse)
 def receive_tank_data(
-    data: schemas.TankDataInput, # <-- MENGGUNAKAN SCHEMA
+    data: schemas.TankDataInput, 
     db: Session = Depends(get_db)
 ):
     """
     IoT Mengirim JSON: {"distance_cm": 20.5}
+    Logika: Cek data tangki. Jika ada -> Update. Jika belum -> Insert.
     """
     TINGGI_TANGKI_CM = 100.0 
     
@@ -105,12 +131,37 @@ def receive_tank_data(
     
     persen = (water_level_cm / TINGGI_TANGKI_CM) * 100
     
-    new_log = models.LogTangki(
-        ketinggian_air=water_level_cm,
-        persentase_isi=persen
-    )
-    db.add(new_log)
-    db.commit()
+    # --- LOGIKA DATABASE (UPDATE OR INSERT) ---
+    try:
+        # 1. Ambil data pertama yang ada di tabel log_tangki
+        # Karena asumsinya cuma ada 1 tangki, kita pakai .first() saja
+        existing_data = db.query(models.LogTangki).first()
+        
+        if existing_data:
+            # === SKENARIO A: UPDATE (Data Sudah Ada) ===
+            existing_data.ketinggian_air = water_level_cm
+            existing_data.persentase_isi = persen
+            
+            # Update waktu agar Web tahu ini data baru
+            from sqlalchemy.sql import func
+            existing_data.updated_at = func.now()
+            
+            db.commit()
+            print(f"🛢️ Update Tangki -> {persen:.1f}%")
+            
+        else:
+            # === SKENARIO B: INSERT (Data Belum Ada/Kosong) ===
+            new_log = models.LogTangki(
+                ketinggian_air=water_level_cm,
+                persentase_isi=persen
+            )
+            db.add(new_log)
+            db.commit()
+            print(f"✨ Data Baru Tangki -> {persen:.1f}%")
+            
+    except Exception as e:
+        print(f"❌ Error DB Tangki: {e}")
+        db.rollback()
     
     return {"status": "recorded", "level_percent": persen}
 
