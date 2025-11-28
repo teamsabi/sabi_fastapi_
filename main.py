@@ -1,10 +1,11 @@
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
+from datetime import datetime
 from sqlalchemy.orm import Session
 from database import engine, get_db
 from typing import List
 import models
-import schemas # Import file schemas yang baru
+import schemas
 from ai_engine import LeafDiseaseDetector
 import shutil
 import os
@@ -39,7 +40,7 @@ def startup_event():
 MANUAL_WATERING_ON = False
 
 # ==========================================
-# 1. ENDPOINT: IOT SENSOR KELEMBAPAN (Mode: Realtime Gauge)
+# 1. ENDPOINT: IOT SENSOR KELEMBAPAN TANAH (Mode: Realtime Gauge)
 # ==========================================
 @app.post("/iot/soil-data", response_model=schemas.IotResponse)
 def receive_soil_data(
@@ -112,7 +113,7 @@ def receive_soil_data(
     return {"status": "success", "pump": "ON" if pump_status else "OFF"}
 
 # ==========================================
-# 2. ENDPOINT: IOT ULTRASONIK TANGKI (Mode: Realtime Gauge)
+# 2. ENDPOINT: IOT ULTRASONIK TANGKI AIR (Mode: Water Level)
 # ==========================================
 @app.post("/iot/water-level", response_model=schemas.IotResponse)
 def receive_tank_data(
@@ -166,54 +167,70 @@ def receive_tank_data(
     return {"status": "recorded", "level_percent": persen}
 
 # ==========================================
-# 3. ENDPOINT: DETEKSI PENYAKIT (Multipart Form)
-#    NOTE: Upload File TIDAK BISA pakai Pydantic JSON Body standar.
-#    Jadi inputnya tetap pakai UploadFile, tapi Outputnya pakai Schema.
+# 3. ENDPOINT: DETEKSI PENYAKIT (ESP32-CAM)
 # ==========================================
 @app.post("/iot/detect-disease", response_model=schemas.DiseaseResponse)
 async def detect_disease(
-    tanaman_id: int, # Tetap Query/Form param karena bercampur file
+    tanaman_id: int, 
     file: UploadFile = File(...), 
     db: Session = Depends(get_db)
 ):
     if not ai_engine:
-        raise HTTPException(status_code=500, detail="AI belum siap")
+        raise HTTPException(status_code=500, detail="AI Engine belum siap")
 
     # A. Simpan Gambar
-    filename = f"{uuid.uuid4()}.jpg"
+    waktu_sekarang = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{waktu_sekarang}_tanaman{tanaman_id}.jpg" 
+    
     file_path = f"static/images/{filename}"
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    
+    # Simpan fisik file
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gagal simpan gambar: {e}")
 
-    # B. Prediksi AI
+    # B. Prediksi Menggunakan AI Engine
     print(f"🔍 Analisa: {filename} ...")
     hasil_ai = ai_engine.predict_image(file_path)
     
-    nama_penyakit = hasil_ai["dominan"]
+    nama_penyakit = hasil_ai["dominan"]     # Contoh: "Bercak Daun"
     confidence = hasil_ai["confidence"]
     detail_json = json.dumps(hasil_ai["detail"])
 
-    # C. Cari Rekomendasi
-    rekomendasi = db.query(models.RekomendasiZat)\
-                    .filter(models.RekomendasiZat.nama_penyakit == nama_penyakit)\
-                    .first()
-    rekomendasi_id = rekomendasi.id if rekomendasi else None
-    rekomendasi_text = rekomendasi.zat_aktif if rekomendasi else "Belum ada data"
+    # C. LOGIKA PENCARIAN ID (Sesuai Keinginan Anda)
+    # Langkah 1: Cari di tabel rekomendasi_zat, baris mana yang nama_penyakit-nya sama dengan hasil AI
+    rekomendasi_item = db.query(models.RekomendasiZat)\
+                         .filter(models.RekomendasiZat.nama_penyakit == nama_penyakit)\
+                         .first()
+    
+    # Langkah 2: Jika ketemu, ambil ID-nya. Jika tidak (misal "Sehat"), biarkan None/Null.
+    rekomendasi_id = rekomendasi_item.id if rekomendasi_item else None
+    
+    # Langkah 3: Ambil teks rekomendasi untuk dikirim balik ke ESP32/HP (Opsional)
+    # PERBAIKAN: Ganti .zat_aktif menjadi .rekomendasi (Sesuai kolom database Anda)
+    rekomendasi_text = rekomendasi_item.rekomendasi if rekomendasi_item else "Tidak ada tindakan khusus"
 
-    # D. Simpan DB
-    new_disease = models.PenyakitDaun(
-        tanaman_id=tanaman_id,
-        user_id=1, 
-        gambar=file_path,
-        hasil_deteksi=nama_penyakit,
-        tingkat_keyakinan=confidence,
-        detail_persentase=detail_json,
-        rekomendasi_id=rekomendasi_id 
-    )
-    db.add(new_disease)
-    db.commit()
+    # D. Simpan ke Database
+    try:
+        new_disease = models.PenyakitDaun(
+            tanaman_id=tanaman_id,
+            user_id=1, 
+            gambar=file_path,
+            hasil_deteksi=nama_penyakit,
+            tingkat_keyakinan=confidence,
+            detail_persentase=detail_json,
+            rekomendasi_id=rekomendasi_id # <--- ID yang ditemukan tadi disimpan di sini
+        )
+        db.add(new_disease)
+        db.commit()
+    except Exception as e:
+        print(f"❌ Error Database Penyakit: {e}")
+        # Lanjut saja agar return tetap jalan
 
-    # Return sesuai Schema DiseaseResponse
+    print(f"✅ Selesai. Hasil: {nama_penyakit} (ID Rekomendasi: {rekomendasi_id})")
+
     return {
         "message": "Deteksi Selesai",
         "hasil": nama_penyakit,

@@ -3,10 +3,21 @@ from sqlalchemy.sql import func
 from database import Base
 
 # Mapping Tabel 'rekomendasi_zat' (Hanya untuk dibaca FastAPI)
+# ==========================================
+# 1. TABEL REKOMENDASI ZAT (SESUAI MIGRATION ANDA)
+# ==========================================
 class RekomendasiZat(Base):
     __tablename__ = "rekomendasi_zat"
-    id = Column(Integer, primary_key=True)
+
+    id = Column(Integer, primary_key=True, index=True)
     nama_penyakit = Column(String(255))
+    deskripsi = Column(Text)
+    gejala = Column(Text)           # Di migration tipe-nya text
+    rekomendasi = Column(Text)      # <--- NAMA KOLOM YANG BENAR (Bukan zat_aktif)
+    cara_penggunaan = Column(Text)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
     # Kolom lain tidak perlu ditulis kalau FastAPI tidak pakai, cukup yang penting aja
 
 class LogKelembapan(Base):
