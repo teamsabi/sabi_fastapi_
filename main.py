@@ -9,15 +9,25 @@ import schemas
 from ai_engine import LeafDiseaseDetector
 import shutil
 import os
-import uuid
 import json
 import warnings
+from fastapi.middleware.cors import CORSMiddleware
 
 # 1. Matikan Warning
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # 2. Inisialisasi
 app = FastAPI(title="Smart Farming API")
+
+# --- TAMBAHKAN BAGIAN INI (CORS) ---
+# Ini penting agar Laravel (Browser) tidak diblokir saat minta data
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Membolehkan semua IP mengakses API ini
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 os.makedirs("static/images", exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -40,17 +50,13 @@ def startup_event():
 MANUAL_WATERING_ON = False
 
 # ==========================================
-# 1. ENDPOINT: IOT SENSOR KELEMBAPAN TANAH (Mode: Realtime Gauge)
+# 1. ENDPOINT: IOT SENSOR KELEMBAPAN TANAH (Mode: LOG HISTORY)
 # ==========================================
 @app.post("/iot/soil-data", response_model=schemas.IotResponse)
 def receive_soil_data(
     data: schemas.SoilDataInput, 
     db: Session = Depends(get_db)
 ):
-    """
-    Cocok untuk Gauge Chart / Speedometer.
-    Hanya menyimpan 1 baris data terakhir per tanaman.
-    """
     global MANUAL_WATERING_ON
     
     t_id = data.tanaman_id
@@ -59,7 +65,7 @@ def receive_soil_data(
     pump_status = False
     trigger = "AUTO"
 
-    # Logika Kontrol Pompa
+    # --- 1. Logika Kontrol Pompa ---
     if mois < 50.0:
         pump_status = True
         print(f"🌱 [AUTO] Kering ({mois}%), Pompa NYALA.")
@@ -73,38 +79,23 @@ def receive_soil_data(
         pump_status = True
         trigger = "MANUAL"
 
-    # --- LOGIKA DATABASE (UPDATE OR INSERT) ---
+    # --- 2. LOGIKA DATABASE (UBAH JADI INSERT HISTORY) ---
     try:
-        # 1. Cari data lama berdasarkan ID Tanaman
-        existing_data = db.query(models.LogKelembapan)\
-                          .filter(models.LogKelembapan.tanaman_id == t_id)\
-                          .first()
+        # Kita TIDAK LAGI mengecek data lama (update).
+        # Kita LANGSUNG membuat data baru setiap kali sensor melapor.
+        new_log = models.LogKelembapan(
+            tanaman_id=t_id,
+            kelembapan_tanah=mois,
+            pompa_on=pump_status,
+            sumber_perintah=trigger
+            # created_at akan otomatis diisi jam sekarang oleh Database
+        )
         
-        if existing_data:
-            # === SKENARIO A: UPDATE (Jarum Gauge Bergerak) ===
-            # Kita timpa nilai lama dengan nilai baru
-            existing_data.kelembapan_tanah = mois
-            existing_data.pompa_on = pump_status
-            existing_data.sumber_perintah = trigger
-            # Paksa update waktu agar kita tahu kapan terakhir update
-            # (Penting untuk status 'Last Updated' di Web)
-            from sqlalchemy.sql import func
-            existing_data.updated_at = func.now()
-            
-            db.commit()
-            print(f"📝 Update Data Tanaman {t_id} -> {mois}%")
-            
-        else:
-            # === SKENARIO B: INSERT (Baru Pertama Kali Pasang) ===
-            new_log = models.LogKelembapan(
-                tanaman_id=t_id,
-                kelembapan_tanah=mois,
-                pompa_on=pump_status,
-                sumber_perintah=trigger
-            )
-            db.add(new_log)
-            db.commit()
-            print(f"✨ Data Baru Tanaman {t_id} -> {mois}%")
+        db.add(new_log)
+        db.commit()
+        db.refresh(new_log) # Ambil ID baru yang terbentuk
+        
+        print(f"📝 History Baru Tersimpan: ID {new_log.id} | {mois}% | Pompa: {pump_status}")
             
     except Exception as e:
         print(f"❌ Error DB: {e}")
@@ -167,7 +158,23 @@ def receive_tank_data(
     return {"status": "recorded", "level_percent": persen}
 
 # ==========================================
-# 3. ENDPOINT: DETEKSI PENYAKIT (ESP32-CAM)
+# ⚠️ KONFIGURASI FOLDER (TAMBAHKAN DI BAGIAN ATAS) ⚠️
+# ==========================================
+# 1. Folder untuk Python (AI butuh ini)
+PYTHON_FOLDER = "static/images"
+
+# 2. Folder untuk Laravel (Agar Web bisa akses)
+# GANTI path ini sesuai lokasi project Laravel di laptop Anda!
+# Contoh: "C:/xampp/htdocs/sabi-project/storage/app/public/penyakit_daun"
+LARAVEL_FOLDER = "/home/ipul/Project/web/storage/app/public/penyakit_daun"
+
+# Buat folder otomatis jika belum ada
+os.makedirs(PYTHON_FOLDER, exist_ok=True)
+os.makedirs(LARAVEL_FOLDER, exist_ok=True)
+
+
+# ==========================================
+# 3. ENDPOINT: DETEKSI PENYAKIT (MODIFIKASI)
 # ==========================================
 @app.post("/iot/detect-disease", response_model=schemas.DiseaseResponse)
 async def detect_disease(
@@ -178,38 +185,42 @@ async def detect_disease(
     if not ai_engine:
         raise HTTPException(status_code=500, detail="AI Engine belum siap")
 
-    # A. Simpan Gambar
+    # A. Simpan Gambar (DUAL STORAGE)
     waktu_sekarang = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{waktu_sekarang}_tanaman{tanaman_id}.jpg" 
     
-    file_path = f"static/images/{filename}"
+    # [UBAH 1] Tentukan dua lokasi penyimpanan
+    path_python = os.path.join(PYTHON_FOLDER, filename)
+    path_laravel = os.path.join(LARAVEL_FOLDER, filename)
     
     # Simpan fisik file
     try:
-        with open(file_path, "wb") as buffer:
+        # 1. Simpan ke folder Python dulu
+        with open(path_python, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        
+        # [UBAH 2] Copy file dari Python ke folder Laravel
+        shutil.copy(path_python, path_laravel)
+        print(f"✅ Gambar tersimpan di Laravel: {path_laravel}")
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gagal simpan gambar: {e}")
 
     # B. Prediksi Menggunakan AI Engine
     print(f"🔍 Analisa: {filename} ...")
-    hasil_ai = ai_engine.predict_image(file_path)
+    # [UBAH 3] AI membaca file dari folder Python
+    hasil_ai = ai_engine.predict_image(path_python)
     
-    nama_penyakit = hasil_ai["dominan"]     # Contoh: "Bercak Daun"
+    nama_penyakit = hasil_ai["dominan"]
     confidence = hasil_ai["confidence"]
     detail_json = json.dumps(hasil_ai["detail"])
 
-    # C. LOGIKA PENCARIAN ID (Sesuai Keinginan Anda)
-    # Langkah 1: Cari di tabel rekomendasi_zat, baris mana yang nama_penyakit-nya sama dengan hasil AI
+    # C. LOGIKA PENCARIAN ID (Tetap sama)
     rekomendasi_item = db.query(models.RekomendasiZat)\
                          .filter(models.RekomendasiZat.nama_penyakit == nama_penyakit)\
                          .first()
     
-    # Langkah 2: Jika ketemu, ambil ID-nya. Jika tidak (misal "Sehat"), biarkan None/Null.
     rekomendasi_id = rekomendasi_item.id if rekomendasi_item else None
-    
-    # Langkah 3: Ambil teks rekomendasi untuk dikirim balik ke ESP32/HP (Opsional)
-    # PERBAIKAN: Ganti .zat_aktif menjadi .rekomendasi (Sesuai kolom database Anda)
     rekomendasi_text = rekomendasi_item.rekomendasi if rekomendasi_item else "Tidak ada tindakan khusus"
 
     # D. Simpan ke Database
@@ -217,19 +228,18 @@ async def detect_disease(
         new_disease = models.PenyakitDaun(
             tanaman_id=tanaman_id,
             user_id=1, 
-            gambar=file_path,
+            gambar=filename, # [UBAH 4] Simpan NAMA FILE saja (bukan path lengkap)
             hasil_deteksi=nama_penyakit,
             tingkat_keyakinan=confidence,
             detail_persentase=detail_json,
-            rekomendasi_id=rekomendasi_id # <--- ID yang ditemukan tadi disimpan di sini
+            rekomendasi_id=rekomendasi_id
         )
         db.add(new_disease)
         db.commit()
     except Exception as e:
         print(f"❌ Error Database Penyakit: {e}")
-        # Lanjut saja agar return tetap jalan
 
-    print(f"✅ Selesai. Hasil: {nama_penyakit} (ID Rekomendasi: {rekomendasi_id})")
+    print(f"✅ Selesai. Hasil: {nama_penyakit}")
 
     return {
         "message": "Deteksi Selesai",
@@ -272,3 +282,26 @@ def get_chart_data(tanaman_id: int, limit: int = 20, db: Session = Depends(get_d
              .limit(limit)\
              .all()
     return data[::-1]
+
+# ==========================================
+# 6. ENDPOINT KHUSUS DASHBOARD (GABUNGAN)
+# ==========================================
+@app.get("/web/dashboard-metrics")
+def get_dashboard_metrics(db: Session = Depends(get_db)):
+    # 1. Ambil Data Tanah TERBARU (Order by ID Descending / Paling Besar)
+    soil = db.query(models.LogKelembapan)\
+             .filter(models.LogKelembapan.tanaman_id == 1)\
+             .order_by(models.LogKelembapan.id.desc())\
+             .first() 
+             
+    # 2. Ambil Data Tangki TERBARU (Jika tangki juga mau dibuat history)
+    # Jika tangki masih pakai logika Update, query ini tetap aman.
+    tank = db.query(models.LogTangki)\
+             .order_by(models.LogTangki.id.desc())\
+             .first()
+
+    return {
+        "soil_moisture": soil.kelembapan_tanah if soil else 0,
+        "pump_status": soil.pompa_on if soil else False,
+        "tank_percent": tank.persentase_isi if tank else 0,
+    }
